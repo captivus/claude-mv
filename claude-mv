@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# claude-mv
+#
+# Rename a project directory *and* its Claude‑Code history folder
+#
+# Usage:
+#   claude-mv [options] OLD_PATH NEW_PATH
+#
+# Options:
+#   -n, --dry-run       Show what would be done, but don’t make any changes.
+#   -y, --yes           Skip the confirmation prompt (assume “yes”).
+#   --no-color          Disable ANSI colour output.
+#   -h, --help          Display this help.
+#
+# Example:
+#   claude-mv -y /home/alice/code/project /home/alice/code/project-renamed
+#
+# Exit status: 0 success, non‑zero on error.
+#-------------------------------------------------------------------------------
+set -euo pipefail
+
+############################################################
+#  Colour handling                                          #
+############################################################
+if [[ -t 1 && "${1:-}" != "--no-color" && -z "${NO_COLOR:-}" ]] && tput colors &>/dev/null; then
+  RED=$(tput setaf 1)
+  GREEN=$(tput setaf 2)
+  YELLOW=$(tput setaf 3)
+  CYAN=$(tput setaf 6)
+  BOLD=$(tput bold)
+  RESET=$(tput sgr0)
+else
+  RED=""; GREEN=""; YELLOW=""; CYAN=""; BOLD=""; RESET=""
+fi
+
+info()    { echo -e "${CYAN}$*${RESET}" >&2; }
+warn()    { echo -e "${YELLOW}⚠ $*${RESET}" >&2; }
+error()   { echo -e "${RED}✖ $*${RESET}" >&2; exit 1; }
+success() { echo -e "${GREEN}✓ $*${RESET}" >&2; }
+
+############################################################
+#  Helper functions                                         #
+############################################################
+usage() {
+  # Print header comment block (from script name line to dashed line)
+  sed -n '/^# claude-mv/,/^#-\{20,\}/p' "$0" | cut -c3-
+  exit 0
+}
+
+abs_path() {
+  # Prefer readlink(1) as it is shipped in coreutils; fall back to realpath.
+  if command -v readlink >/dev/null 2>&1; then
+    readlink -fm "$1"
+  elif command -v realpath >/dev/null 2>&1; then
+    realpath -m "$1"
+  else
+    (cd "$(dirname "$1")" 2>/dev/null && printf "%s/%s\n" "$(pwd -P)" "$(basename "$1")")
+  fi
+}
+
+encode_key() {
+  # Map an absolute path to Claude's hyphen‑encoded key.
+  #  • All slashes  → "-"
+  #  • All underscores → "-"  (so  network_learning → network-learning)
+  #  • Leading slash becomes leading dash
+  #  • "_segment" yields "--segment" naturally after both replacements.
+  local p="${1%/}"      # strip trailing slash
+  p="${p//_/-}"
+  echo "${p//\//-}"
+}
+
+############################################################
+#  Option parsing                                           #
+############################################################
+DRY_RUN=false
+FORCE=false
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=true ; shift ;;
+    -y|--yes)     FORCE=true  ; shift ;;
+    --no-color)   RED=""; GREEN=""; YELLOW=""; CYAN=""; BOLD=""; RESET=""; shift ;;
+    -h|--help)    usage ;;
+    --) shift; break ;;
+    -*) error "Unknown option: $1" ;;
+    *)  POSITIONAL+=("$1") ; shift ;;
+  esac
+done
+
+set -- "${POSITIONAL[@]}" "$@"
+
+[[ $# -ne 2 ]] && usage
+OLD_PATH="${1%/}"   # strip trailing slash if supplied
+NEW_PATH="${2%/}"
+
+############################################################
+#  Path normalisation & validation                          #
+############################################################
+OLD_ABS=$(abs_path "$OLD_PATH")
+NEW_ABS=$(abs_path "$NEW_PATH")
+[[ "$OLD_ABS" == "$NEW_ABS" ]] && error "OLD_PATH and NEW_PATH are identical."
+[[ -d "$OLD_ABS" ]] || error "Source directory not found: $OLD_ABS"
+[[ ! -e "$NEW_ABS" ]] || error "Destination already exists: $NEW_ABS"
+
+OLD_KEY=$(encode_key "$OLD_ABS")
+NEW_KEY=$(encode_key "$NEW_ABS")
+
+HIST_ROOT="$HOME/.claude/projects"
+OLD_HIST="$HIST_ROOT/$OLD_KEY"
+NEW_HIST="$HIST_ROOT/$NEW_KEY"
+
+############################################################
+#  Summary & confirmation                                   #
+############################################################
+info "Planned actions:"
+info "  Project dir : $OLD_ABS -> $NEW_ABS"
+if [[ -d "$OLD_HIST" ]]; then
+  info "  Claude hist : $OLD_HIST -> $NEW_HIST"
+else
+  warn "No Claude history found for $OLD_ABS (expected $OLD_HIST)."
+fi
+
+if ! $FORCE && ! $DRY_RUN; then
+  read -rp "${BOLD}Proceed? [y/N] ${RESET}" confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
+fi
+
+############################################################
+#  Execute (or simulate)                                    #
+############################################################
+run() {
+  if $DRY_RUN; then
+    echo "DRY RUN: $*"; return
+  fi
+  "$@"
+}
+
+# Ensure we are not inside OLD_PATH when renaming
+NEED_CWD_FIX=false
+if [[ "$(pwd -P)" == "$OLD_ABS" || "$(pwd -P)/" == "$OLD_ABS/"* ]]; then
+  NEED_CWD_FIX=true
+  cd /
+fi
+
+run mv -- "$OLD_ABS" "$NEW_ABS" && success "Project directory renamed."
+
+if [[ -d "$OLD_HIST" ]]; then
+  if [[ -e "$NEW_HIST" ]]; then
+    warn "History directory already exists at $NEW_HIST – keeping both histories."
+  else
+    run mv -- "$OLD_HIST" "$NEW_HIST" && success "History directory renamed."
+  fi
+fi
+
+# Return user to new directory if we had to hop away earlier
+if $NEED_CWD_FIX && ! $DRY_RUN; then
+  cd "$NEW_ABS"
+fi
+
+$DRY_RUN && info "Dry‑run complete – no changes made." || success "Done."
+
